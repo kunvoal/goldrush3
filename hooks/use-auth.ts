@@ -20,15 +20,23 @@ import {
 } from '@deriv/core';
 import type { AuthInfo, DerivAccount, AuthState, AuthConfig } from '@deriv/core';
 
-function getAuthConfig(): AuthConfig {
+export function getEffectiveClientId(): string {
+  if (typeof window !== 'undefined') {
+    const custom = localStorage.getItem('deriv_custom_client_id');
+    if (custom && custom.trim().length > 0) return custom.trim();
+  }
+  return process.env.NEXT_PUBLIC_DERIV_APP_ID ?? '34kDYD0Jh226YNUlY8nTL';
+}
+
+function getAuthConfig(overrideClientId?: string): AuthConfig {
   const config: AuthConfig = {
-    clientId: process.env.NEXT_PUBLIC_DERIV_APP_ID ?? '33AXtdkpnn5FFGi6pkEjy',
+    clientId: overrideClientId ?? getEffectiveClientId(),
     redirectUri:
       process.env.NEXT_PUBLIC_DERIV_REDIRECT_URI ??
       (typeof window !== 'undefined' ? window.location.origin : ''),
   };
 
-  const scopesEnv = process.env.NEXT_PUBLIC_DERIV_OAUTH_SCOPES ?? 'trade,account_manage';
+  const scopesEnv = process.env.NEXT_PUBLIC_DERIV_OAUTH_SCOPES ?? 'trade';
   if (scopesEnv) {
     config.scopes = scopesEnv.split(',').map((s) => s.trim()).join(' ');
   }
@@ -54,31 +62,60 @@ export interface UseAuthReturn {
   activeAccount: DerivAccount | null;
   activeAccountId: string | null;
   wsUrl: string | undefined;
-  login: () => Promise<void>;
+  login: (overrideClientId?: string) => Promise<void>;
+  authorizeWithToken: (token: string, wsInstance: any) => Promise<{ success: boolean; error?: string }>;
   signUp: () => Promise<void>;
   logout: () => void;
   switchAccount: (accountId: string) => Promise<void>;
   error: string | null;
   updateBalance: (accountId: string, newBalance: number | string) => void;
+  clientId: string;
+  setCustomClientId: (id: string) => void;
+  tokenLoginActive: boolean;
 }
 
 export function useAuth(): UseAuthReturn {
-  const [authState, setAuthState] = useState<AuthState>(() =>
-    typeof window !== 'undefined' && getAuthInfo() ? 'authenticated' : 'unauthenticated'
-  );
+  const [clientId, setClientIdState] = useState<string>(() => getEffectiveClientId());
+  const [tokenLoginActive, setTokenLoginActive] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return Boolean(localStorage.getItem('deriv_pat_token'));
+  });
+
+  const [authState, setAuthState] = useState<AuthState>(() => {
+    if (typeof window === 'undefined') return 'unauthenticated';
+    if (getAuthInfo()) return 'authenticated';
+    if (localStorage.getItem('deriv_pat_token')) return 'authenticated';
+    return 'unauthenticated';
+  });
+
   const [accounts, setAccounts] = useState<DerivAccount[]>(() => {
     if (typeof window === 'undefined') return [];
     return getDerivAccounts() ?? [];
   });
+
   const [activeAccountId, setActiveAccountId] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
     return getActiveLoginId() ?? null;
   });
+
   const [wsUrl, setWsUrl] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const initRef = useRef(false);
   const activeAccountIdRef = useRef<string | null>(null);
   const tabHiddenAtRef = useRef<number | null>(null);
+
+  const setCustomClientId = useCallback((id: string) => {
+    if (typeof window !== 'undefined') {
+      const clean = id.trim();
+      if (clean) {
+        localStorage.setItem('deriv_custom_client_id', clean);
+        setClientIdState(clean);
+      } else {
+        localStorage.removeItem('deriv_custom_client_id');
+        setClientIdState(process.env.NEXT_PUBLIC_DERIV_APP_ID ?? '33AXtdkpnn5FFGi6pkEjy');
+      }
+    }
+  }, []);
 
   const fetchOTPUrl = useCallback(async (accountId: string, authInfo: AuthInfo): Promise<string> => {
     return getWebSocketOTP(accountId, authInfo, getAuthConfig().clientId);
@@ -96,8 +133,103 @@ export function useAuth(): UseAuthReturn {
       setWsUrl(otpUrl);
     }
 
+    setTokenLoginActive(false);
     setAuthState('authenticated');
   }, [fetchOTPUrl]);
+
+  // Direct Token (PAT) Authorization via WebSocket
+  const authorizeWithToken = useCallback(async (
+    token: string,
+    wsInstance: any
+  ): Promise<{ success: boolean; error?: string }> => {
+    if (!wsInstance) {
+      return { success: false, error: 'WebSocket is connecting... please try again.' };
+    }
+
+    setAuthState('authenticating');
+    setError(null);
+
+    try {
+      const res = await wsInstance.send({ authorize: token.trim() }) as {
+        authorize?: {
+          account_list?: Array<{
+            account_category?: string;
+            account_type?: string;
+            currency?: string;
+            is_disabled?: number;
+            is_virtual?: number;
+            landing_company_name?: string;
+            loginid: string;
+          }>;
+          balance: number | string;
+          currency: string;
+          email?: string;
+          fullname?: string;
+          is_virtual: number;
+          landing_company_name?: string;
+          loginid: string;
+          scopes?: string[];
+          user_id?: number;
+        };
+        error?: {
+          code: string;
+          message: string;
+        };
+      };
+
+      if (res.error || !res.authorize) {
+        const errMsg = res.error?.message || 'Token authorization failed. Please check your token.';
+        setError(errMsg);
+        setAuthState('unauthenticated');
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('deriv_pat_token');
+        }
+        setTokenLoginActive(false);
+        return { success: false, error: errMsg };
+      }
+
+      const authData = res.authorize;
+      const parsedAccounts: DerivAccount[] = (authData.account_list || []).map((acc) => ({
+        account_id: acc.loginid,
+        account_type: acc.is_virtual ? 'demo' : 'real',
+        currency: acc.currency || authData.currency || 'USD',
+        balance: acc.loginid === authData.loginid ? String(authData.balance) : '0.00',
+        group: acc.account_category || 'trading',
+        status: acc.is_disabled ? 'disabled' : 'active',
+      }));
+
+      if (parsedAccounts.length === 0 || !parsedAccounts.some(a => a.account_id === authData.loginid)) {
+        parsedAccounts.unshift({
+          account_id: authData.loginid,
+          account_type: authData.is_virtual ? 'demo' : 'real',
+          currency: authData.currency || 'USD',
+          balance: String(authData.balance),
+          group: 'trading',
+          status: 'active',
+        });
+      }
+
+      setAccounts(parsedAccounts);
+      setActiveAccountId(authData.loginid);
+      storeDerivAccounts(parsedAccounts);
+      setActiveLoginId(authData.loginid);
+      setAccountType(authData.is_virtual ? 'demo' : 'real');
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('deriv_pat_token', token.trim());
+      }
+      setTokenLoginActive(true);
+      setAuthState('authenticated');
+      setError(null);
+
+      return { success: true };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Network error during authorization';
+      setError(errMsg);
+      setAuthState('unauthenticated');
+      return { success: false, error: errMsg };
+    }
+  }, []);
 
   useEffect(() => {
     if (initRef.current) return;
@@ -170,7 +302,7 @@ export function useAuth(): UseAuthReturn {
   }, [activeAccountId]);
 
   useEffect(() => {
-    if (authState !== 'authenticated') return;
+    if (authState !== 'authenticated' || tokenLoginActive) return;
 
     const handleVisibilityChange = async () => {
       if (document.visibilityState === 'hidden') {
@@ -198,10 +330,11 @@ export function useAuth(): UseAuthReturn {
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [authState, fetchOTPUrl]);
+  }, [authState, fetchOTPUrl, tokenLoginActive]);
 
-  const login = useCallback(async () => {
-    await initiateLogin(getAuthConfig());
+  const login = useCallback(async (overrideClientId?: string) => {
+    const config = getAuthConfig(overrideClientId);
+    await initiateLogin(config);
   }, []);
 
   const signUp = useCallback(async () => {
@@ -210,6 +343,10 @@ export function useAuth(): UseAuthReturn {
 
   const logout = useCallback(() => {
     coreLogout();
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('deriv_pat_token');
+    }
+    setTokenLoginActive(false);
     setAccounts([]);
     setActiveAccountId(null);
     setWsUrl(undefined);
@@ -219,17 +356,25 @@ export function useAuth(): UseAuthReturn {
 
   const switchAccount = useCallback(async (accountId: string) => {
     const authInfo = getAuthInfo();
-    if (!authInfo) return;
-
-    try {
+    if (authInfo) {
+      try {
+        const account = accounts.find((a) => a.account_id === accountId);
+        if (account) setAccountType(account.account_type);
+        const otpUrl = await fetchOTPUrl(accountId, authInfo);
+        setActiveLoginId(accountId);
+        setActiveAccountId(accountId);
+        setWsUrl(otpUrl);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Account switch failed');
+      }
+    } else {
+      // Local account selection
       const account = accounts.find((a) => a.account_id === accountId);
-      if (account) setAccountType(account.account_type);
-      const otpUrl = await fetchOTPUrl(accountId, authInfo);
-      setActiveLoginId(accountId);
-      setActiveAccountId(accountId);
-      setWsUrl(otpUrl);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Account switch failed');
+      if (account) {
+        setActiveLoginId(accountId);
+        setActiveAccountId(accountId);
+        setAccountType(account.account_type);
+      }
     }
   }, [fetchOTPUrl, accounts]);
 
@@ -255,10 +400,14 @@ export function useAuth(): UseAuthReturn {
     activeAccountId,
     wsUrl,
     login,
+    authorizeWithToken,
     signUp,
     logout,
     switchAccount,
     error,
     updateBalance,
+    clientId,
+    setCustomClientId,
+    tokenLoginActive,
   };
 }
