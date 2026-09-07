@@ -150,6 +150,9 @@ export function ExecutionDeck({
           <div className="flex items-center gap-2">
             <Bot className={`h-4 w-4 ${isBotArmed ? 'text-gold animate-bounce' : 'text-slate-400'}`} />
             <span className="font-bold text-white">BOT</span>
+            <span className="px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-400 border border-orange-500/30 text-[9px] font-bold uppercase tracking-wider">
+              DEMO / PAPER
+            </span>
           </div>
 
           <button

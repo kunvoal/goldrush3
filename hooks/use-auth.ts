@@ -95,7 +95,18 @@ export function useAuth(): UseAuthReturn {
 
   const [activeAccountId, setActiveAccountId] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
-    return getActiveLoginId() ?? null;
+    const stored = getDerivAccounts();
+    // Strictly prioritize Demo / Paper account (VRTC... or account_type === 'demo')
+    const demo = stored?.find(a => a.account_type === 'demo' || a.account_id.startsWith('VRTC'));
+    if (demo) return demo.account_id;
+    const storedLoginId = getActiveLoginId();
+    if (storedLoginId) {
+      const match = stored?.find(a => a.account_id === storedLoginId);
+      if (match && (match.account_type === 'demo' || match.account_id.startsWith('VRTC'))) {
+        return storedLoginId;
+      }
+    }
+    return stored?.[0]?.account_id ?? null;
   });
 
   const [wsUrl, setWsUrl] = useState<string | undefined>(undefined);
@@ -126,10 +137,16 @@ export function useAuth(): UseAuthReturn {
     setAccounts(fetchedAccounts);
 
     if (fetchedAccounts.length > 0) {
-      const firstAccount = fetchedAccounts[0];
-      setActiveAccountId(firstAccount.account_id);
+      // Strictly default to Demo / Paper account (VRTC... or account_type === 'demo')
+      const demoAccount = fetchedAccounts.find(
+        (a) => a.account_type === 'demo' || a.account_id.startsWith('VRTC')
+      );
+      const chosenAccount = demoAccount || fetchedAccounts[0];
+      setActiveAccountId(chosenAccount.account_id);
+      setActiveLoginId(chosenAccount.account_id);
+      setAccountType(chosenAccount.account_type);
 
-      const otpUrl = await fetchOTPUrl(firstAccount.account_id, authInfo);
+      const otpUrl = await fetchOTPUrl(chosenAccount.account_id, authInfo);
       setWsUrl(otpUrl);
     }
 
@@ -272,8 +289,17 @@ export function useAuth(): UseAuthReturn {
         const storedAccounts = getDerivAccounts();
         if (storedAccounts && storedAccounts.length > 0) {
           setAccounts(storedAccounts);
-          const loginId = getActiveLoginId() ?? storedAccounts[0].account_id;
+          // Strictly default to Demo / Paper account (VRTC... or account_type === 'demo')
+          const demoAccount = storedAccounts.find(
+            (a) => a.account_type === 'demo' || a.account_id.startsWith('VRTC')
+          );
+          const activeStoredId = getActiveLoginId();
+          const activeStored = storedAccounts.find((a) => a.account_id === activeStoredId);
+          const loginId = (activeStored?.account_type === 'demo' || activeStored?.account_id.startsWith('VRTC'))
+            ? activeStored.account_id
+            : (demoAccount?.account_id ?? storedAccounts[0].account_id);
           setActiveAccountId(loginId);
+          setActiveLoginId(loginId);
 
           try {
             const otpUrl = await fetchOTPUrl(loginId, storedAuth);
@@ -391,7 +417,8 @@ export function useAuth(): UseAuthReturn {
     });
   }, []);
 
-  const activeAccount = accounts.find((acc) => acc.account_id === activeAccountId) ?? accounts[0] ?? null;
+  const demoFallback = accounts.find((acc) => acc.account_type === 'demo' || acc.account_id.startsWith('VRTC'));
+  const activeAccount = accounts.find((acc) => acc.account_id === activeAccountId) ?? demoFallback ?? accounts[0] ?? null;
 
   return {
     authState,

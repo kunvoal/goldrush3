@@ -274,8 +274,8 @@ export function useFiveTickTrade({
     });
   }, [quantState, activeAccount, updateBalance, playSound, addJournal]);
 
-  // Execute trade trigger
-  const executeTrade = useCallback(async (direction: DirectionType) => {
+  // Execute trade trigger (Guaranteed demo/paper mode by default for agent execution)
+  const executeTrade = useCallback(async (direction: DirectionType, isAgentExecution = false) => {
     if (!ws || !isConnected || isExecuting || activeTrade?.status === 'OPEN') {
       return;
     }
@@ -286,9 +286,32 @@ export function useFiveTickTrade({
     const stakeVal = parseFloat(stake) || 0.35;
     const currentPrice = quantState?.currentPrice || 0;
     const fallbackExpectedPayout = parseFloat((stakeVal * liveMultiplier).toFixed(2));
+    const isDemo = activeAccount?.account_type === 'demo' || activeAccount?.account_id?.startsWith('VRTC');
+
+    // STRICT AGENT GUARD: Agent execution is strictly locked to Demo / Paper. Zero real funds risk.
+    if (isAgentExecution && !isDemo && activeAccount) {
+      addJournal('INFO', `[AGENT GUARD] Real account detected. Agent execution strictly routed to Paper/Demo simulation.`);
+      const simTrade: ActiveTradeState = {
+        contractId: 'PAPER_' + Math.floor(10000 + Math.random() * 90000),
+        symbol: selectedAsset,
+        direction,
+        stake: stakeVal,
+        entryPrice: currentPrice,
+        expectedPayout: fallbackExpectedPayout,
+        currentTick: 0,
+        steps: [],
+        status: 'OPEN',
+        payout: 0,
+        profit: 0,
+      };
+      setActiveTrade(simTrade);
+      setIsExecuting(false);
+      return;
+    }
 
     try {
-      addJournal('TRIGGER', `Fired ${direction === 'RUNHIGH' ? 'ONLY UP' : 'ONLY DOWN'} on ${selectedAsset} ($${stakeVal.toFixed(2)})`);
+      const modeLabel = isAgentExecution ? '[AGENT DEMO]' : (isDemo ? '[DEMO]' : '[MANUAL]');
+      addJournal('TRIGGER', `${modeLabel} Fired ${direction === 'RUNHIGH' ? 'ONLY UP' : 'ONLY DOWN'} on ${selectedAsset} ($${stakeVal.toFixed(2)})`);
 
       // 1. Request Proposal with underlying_symbol
       const proposalRes = await ws.send({
@@ -333,15 +356,15 @@ export function useFiveTickTrade({
       };
 
       setActiveTrade(newTrade);
-      addJournal('INFO', `Order placed #${buyRes.buy.contract_id}. Trajectory tracking active.`);
+      addJournal('INFO', `Order placed #${buyRes.buy.contract_id} on ${activeAccount?.account_id || 'Virtual'}. Trajectory tracking active.`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Trade execution failed';
       setErrorMessage(msg);
       addJournal('FAIL', `Execution error: ${msg}`);
 
-      if (!activeAccount) {
+      if (!activeAccount || isAgentExecution) {
         setActiveTrade({
-          contractId: 'SIM_' + Math.floor(Math.random() * 10000),
+          contractId: 'PAPER_' + Math.floor(Math.random() * 10000),
           symbol: selectedAsset,
           direction,
           stake: stakeVal,
@@ -359,7 +382,7 @@ export function useFiveTickTrade({
     }
   }, [ws, isConnected, isExecuting, activeTrade, stake, selectedAsset, quantState, activeAccount, addJournal, liveMultiplier]);
 
-  // Autonomous Bot Loop
+  // Autonomous Bot Loop (Agent Execution strictly demo/paper)
   useEffect(() => {
     if (!isBotArmed || botCooldown || activeTrade?.status === 'OPEN' || !quantState) {
       return;
@@ -380,8 +403,8 @@ export function useFiveTickTrade({
         }
       }
 
-      addJournal('TRIGGER', `Bot signal hit: Prime ${quantState.primeScore}% >= ${botMinPrime}% threshold`);
-      executeTrade(targetDirection);
+      addJournal('TRIGGER', `[AGENT] Signal hit: Prime ${quantState.primeScore}% >= ${botMinPrime}% threshold`);
+      executeTrade(targetDirection, true);
 
       setBotCooldown(true);
       setTimeout(() => setBotCooldown(false), 6500);

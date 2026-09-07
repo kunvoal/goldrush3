@@ -31,9 +31,13 @@ export async function fetchAccounts(
   storeDerivAccounts(accounts);
 
   if (accounts.length > 0) {
-    const firstAccount = accounts[0];
-    setActiveLoginId(firstAccount.account_id);
-    setAccountType(firstAccount.account_type);
+    // Strictly default to Demo / Paper account (VRTC... or account_type === 'demo')
+    const demoAccount = accounts.find(
+      (a) => a.account_type === 'demo' || a.account_id.startsWith('VRTC')
+    );
+    const chosenAccount = demoAccount || accounts[0];
+    setActiveLoginId(chosenAccount.account_id);
+    setAccountType(chosenAccount.account_type);
   }
 
   return accounts;
